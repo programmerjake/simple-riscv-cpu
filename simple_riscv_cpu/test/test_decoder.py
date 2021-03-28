@@ -3,7 +3,7 @@
 
 import enum
 from typing import Dict
-from simple_riscv_cpu.cpu import CPUDecoder, Op
+from simple_riscv_cpu.cpu import CPUDecoder, LoadStoreSize, Op
 from nmigen.sim import Simulator, Delay
 import unittest
 
@@ -59,7 +59,8 @@ class TestDecoder(unittest.TestCase):
         self.check(0x44CA0B23, {'op': Op.StoreByte,
                                 'immediate': 0x456,
                                 'rs1': 0x14,
-                                'rs2': 0xC})
+                                'rs2': 0xC,
+                                'load_store_size': LoadStoreSize.Byte})
 
     def test_bltu(self):
         self.check(0x25466363, {'op': Op.BranchLTUnsigned,

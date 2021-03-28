@@ -3,10 +3,13 @@
 
 import enum
 from typing import List
-from nmigen.hdl.ast import Cat, Const, Mux, Repl, Signal, unsigned
+from nmigen.hdl.ast import Cat, Const, Mux, Repl, Signal, signed, unsigned
 from nmigen.hdl.dsl import Module
 from nmigen.hdl.ir import Elaboratable
 from nmigen.hdl.mem import Memory
+
+MEMORY_START_ADDRESS = 0x10000
+RESET_ADDRESS = MEMORY_START_ADDRESS
 
 
 class CPUMemory(Elaboratable):
@@ -31,20 +34,23 @@ class CPUMemory(Elaboratable):
         # data read port
         read_port = self._memory.read_port(domain="comb")
         m.submodules += read_port
-        m.d.comb += read_port.addr.eq(self.address)
+        m.d.comb += read_port.addr.eq((self.address -
+                                       MEMORY_START_ADDRESS) >> 2)
         m.d.comb += self.read_data.eq(read_port.data)
 
         # data write port
         write_port = self._memory.write_port(granularity=8)
         m.submodules += write_port
-        m.d.comb += write_port.addr.eq(self.address)
+        m.d.comb += write_port.addr.eq((self.address -
+                                        MEMORY_START_ADDRESS) >> 2)
         m.d.comb += write_port.data.eq(self.write_data)
         m.d.comb += write_port.en.eq(self.write_byte_enables)
 
         # instruction read port
         instruction_read_port = self._memory.read_port(domain="comb")
         m.submodules += instruction_read_port
-        m.d.comb += instruction_read_port.addr.eq(self.instruction_address)
+        m.d.comb += instruction_read_port.addr.eq((self.instruction_address -
+                                                   MEMORY_START_ADDRESS) >> 2)
         m.d.comb += self.instruction_read_data.eq(instruction_read_port.data)
         return m
 
@@ -92,6 +98,12 @@ class OpVariant(enum.Enum):
     Sub_ShiftSigned = enum.auto()
 
 
+class LoadStoreSize(enum.Enum):
+    Byte = enum.auto()
+    Half = enum.auto()
+    Word = enum.auto()
+
+
 class CPUDecoder(Elaboratable):
     def __init__(self):
         self.instruction_in = Signal(unsigned(32))
@@ -106,6 +118,8 @@ class CPUDecoder(Elaboratable):
         self.rs1 = Signal(unsigned(5))
         self.rs2 = Signal(unsigned(5))
         self.variant = Signal(OpVariant)
+        self.load_store_size = Signal(LoadStoreSize)
+        self.load_signed = Signal()
 
     def elaborate(self, platform):
         m = Module()
@@ -174,28 +188,41 @@ class CPUDecoder(Elaboratable):
             with m.Case('------- ----- ----- 000 ----- 0000011'):
                 m.d.comb += self.op.eq(Op.LoadByte)
                 m.d.comb += self.immediate.eq(self.i_type_immediate)
+                m.d.comb += self.load_store_size.eq(LoadStoreSize.Byte)
+                m.d.comb += self.load_signed.eq(True)
             with m.Case('------- ----- ----- 001 ----- 0000011'):
                 m.d.comb += self.op.eq(Op.LoadHalf)
                 m.d.comb += self.immediate.eq(self.i_type_immediate)
+                m.d.comb += self.load_store_size.eq(LoadStoreSize.Half)
+                m.d.comb += self.load_signed.eq(True)
             with m.Case('------- ----- ----- 010 ----- 0000011'):
                 m.d.comb += self.op.eq(Op.LoadWord)
                 m.d.comb += self.immediate.eq(self.i_type_immediate)
+                m.d.comb += self.load_store_size.eq(LoadStoreSize.Word)
+                m.d.comb += self.load_signed.eq(True)
             with m.Case('------- ----- ----- 100 ----- 0000011'):
                 m.d.comb += self.op.eq(Op.LoadByteUnsigned)
                 m.d.comb += self.immediate.eq(self.i_type_immediate)
+                m.d.comb += self.load_store_size.eq(LoadStoreSize.Byte)
+                m.d.comb += self.load_signed.eq(False)
             with m.Case('------- ----- ----- 101 ----- 0000011'):
                 m.d.comb += self.op.eq(Op.LoadHalfUnsigned)
                 m.d.comb += self.immediate.eq(self.i_type_immediate)
+                m.d.comb += self.load_store_size.eq(LoadStoreSize.Half)
+                m.d.comb += self.load_signed.eq(False)
 
             with m.Case('------- ----- ----- 000 ----- 0100011'):
                 m.d.comb += self.op.eq(Op.StoreByte)
                 m.d.comb += self.immediate.eq(self.s_type_immediate)
+                m.d.comb += self.load_store_size.eq(LoadStoreSize.Byte)
             with m.Case('------- ----- ----- 001 ----- 0100011'):
                 m.d.comb += self.op.eq(Op.StoreHalf)
                 m.d.comb += self.immediate.eq(self.s_type_immediate)
+                m.d.comb += self.load_store_size.eq(LoadStoreSize.Half)
             with m.Case('------- ----- ----- 010 ----- 0100011'):
                 m.d.comb += self.op.eq(Op.StoreWord)
                 m.d.comb += self.immediate.eq(self.s_type_immediate)
+                m.d.comb += self.load_store_size.eq(LoadStoreSize.Word)
 
             with m.Case('------- ----- ----- 000 ----- 0010011'):
                 m.d.comb += self.op.eq(Op.AddImm)
@@ -250,4 +277,245 @@ class CPUDecoder(Elaboratable):
 
             with m.Default():
                 m.d.comb += self.op.eq(Op.Invalid)
+        return m
+
+
+class CPURegisters(Elaboratable):
+    def __init__(self):
+        self.rs1_addr = Signal(unsigned(5))
+        self.rs1_read_data = Signal(unsigned(32))
+
+        self.rs2_addr = Signal(unsigned(5))
+        self.rs2_read_data = Signal(unsigned(32))
+
+        self.rd_addr = Signal(unsigned(5))
+        self.rd_write_enable = Signal()
+        self.rd_write_data = Signal(unsigned(32))
+
+        self.regs = [Signal(unsigned(32), name=f"x{i}") for i in range(32)]
+
+    def elaborate(self, platform):
+        m = Module()
+        with m.Switch(self.rs1_addr):
+            for i in range(32):
+                with m.Case(i):
+                    m.d.comb += self.rs1_read_data.eq(self.regs[i])
+
+        with m.Switch(self.rs2_addr):
+            for i in range(32):
+                with m.Case(i):
+                    m.d.comb += self.rs2_read_data.eq(self.regs[i])
+
+        with m.Switch(self.rd_addr):
+            for i in range(32):
+                with m.Case(i):
+                    if i != 0:
+                        with m.If(self.rd_write_enable):
+                            m.d.sync += self.regs[i].eq(self.rd_write_data)
+
+        return m
+
+
+class CPU(Elaboratable):
+    def __init__(self):
+        self.memory = CPUMemory()
+        self.decoder = CPUDecoder()
+        self.registers = CPURegisters()
+        self.pc = Signal(unsigned(32), reset=RESET_ADDRESS)
+        self.next_pc = Signal(unsigned(32))
+        self.load_data = Signal(unsigned(32))
+        self.load_data_byte = Signal(unsigned(8))
+        self.load_data_half = Signal(unsigned(16))
+        self.load_store_address = Signal(unsigned(32))
+        self.store_byte_enables = Signal(unsigned(4))
+        self.store_half_enables = Signal(unsigned(2))
+        self.rs1_read_data_signed = Signal(signed(32))
+        self.rs2_read_data_signed = Signal(signed(32))
+        self.immediate_signed = Signal(signed(32))
+
+    def elaborate(self, platform):
+        m = Module()
+        m.submodules.memory = self.memory
+        m.submodules.decoder = self.decoder
+        m.submodules.registers = self.registers
+
+        m.d.comb += self.memory.instruction_address.eq(self.pc)
+        m.d.comb += self.decoder.instruction_in.eq(
+            self.memory.instruction_read_data)
+        m.d.comb += self.immediate_signed.eq(self.decoder.immediate)
+        m.d.comb += self.registers.rd_addr.eq(self.decoder.rd)
+        m.d.comb += self.registers.rs1_addr.eq(self.decoder.rs1)
+        m.d.comb += self.rs1_read_data_signed.eq(self.registers.rs1_read_data)
+        m.d.comb += self.registers.rs2_addr.eq(self.decoder.rs2)
+        m.d.comb += self.rs2_read_data_signed.eq(self.registers.rs2_read_data)
+        m.d.comb += self.registers.rd_write_enable.eq(0)
+        m.d.comb += self.load_store_address.eq(self.registers.rs1_read_data +
+                                               self.decoder.immediate)
+        m.d.comb += self.memory.address.eq(self.load_store_address & ~0x3)
+
+        with m.Switch(self.decoder.load_store_size):
+            with m.Case(LoadStoreSize.Byte):
+                byte_index = self.load_store_address[0:2]
+                m.d.comb += self.store_byte_enables.eq(1 << byte_index)
+                m.d.comb += self.load_data_byte.eq(
+                    self.memory.read_data.word_select(byte_index, 8))
+                m.d.comb += self.memory.write_data.eq(
+                    Repl(self.registers.rs2_read_data[0:8], 4))
+                m.d.comb += self.load_data.eq(
+                    Cat(self.load_data_byte,
+                        Repl(self.decoder.load_signed &
+                             self.load_data_byte[7], 24)))
+            with m.Case(LoadStoreSize.Half):
+                half_index = self.load_store_address[1]
+                m.d.comb += self.store_half_enables.eq(1 << half_index)
+                m.d.comb += self.store_byte_enables.eq(Cat(
+                    self.store_half_enables[0],
+                    self.store_half_enables[0],
+                    self.store_half_enables[1],
+                    self.store_half_enables[1],
+                ))
+                m.d.comb += self.load_data_half.eq(
+                    self.memory.read_data.word_select(half_index, 16))
+                m.d.comb += self.memory.write_data.eq(
+                    Repl(self.registers.rs2_read_data[0:16], 2))
+                m.d.comb += self.load_data.eq(
+                    Cat(self.load_data_half,
+                        Repl(self.decoder.load_signed &
+                             self.load_data_half[15], 16)))
+            with m.Case(LoadStoreSize.Word):
+                m.d.comb += self.store_byte_enables.eq(0xF)
+                m.d.comb += self.memory.write_data.eq(
+                    self.registers.rs2_read_data)
+                m.d.comb += self.load_data.eq(self.memory.read_data)
+
+        m.d.comb += self.next_pc.eq(self.pc + 4)
+        m.d.sync += self.pc.eq(self.next_pc)
+
+        with m.Switch(self.decoder.op):
+            with m.Case(Op.Invalid):
+                m.d.comb += self.next_pc.eq(self.pc)
+            with m.Case(Op.LoadUpperImm):
+                m.d.comb += self.registers.rd_write_enable.eq(True)
+                m.d.comb += self.registers.rd_write_data.eq(
+                    self.decoder.immediate)
+            with m.Case(Op.AddUpperImmPC):
+                m.d.comb += self.registers.rd_write_enable.eq(True)
+                m.d.comb += self.registers.rd_write_data.eq(
+                    self.decoder.immediate + self.pc)
+            with m.Case(Op.JumpAndLink):
+                m.d.comb += self.registers.rd_write_enable.eq(True)
+                m.d.comb += self.registers.rd_write_data.eq(self.next_pc)
+                m.d.comb += self.next_pc.eq(self.pc + self.decoder.immediate)
+            with m.Case(Op.JumpAndLinkReg):
+                m.d.comb += self.registers.rd_write_enable.eq(True)
+                m.d.comb += self.registers.rd_write_data.eq(self.next_pc)
+                m.d.comb += self.next_pc.eq((self.registers.rs1_read_data +
+                                             self.decoder.immediate) & ~0x1)
+            with m.Case(Op.BranchEQ):
+                with m.If(self.registers.rs1_read_data == self.registers.rs2_read_data):
+                    m.d.comb += self.next_pc.eq(self.pc +
+                                                self.decoder.immediate)
+            with m.Case(Op.BranchNE):
+                with m.If(self.registers.rs1_read_data != self.registers.rs2_read_data):
+                    m.d.comb += self.next_pc.eq(self.pc +
+                                                self.decoder.immediate)
+            with m.Case(Op.BranchLT):
+                with m.If(self.rs1_read_data_signed < self.rs2_read_data_signed):
+                    m.d.comb += self.next_pc.eq(self.pc +
+                                                self.decoder.immediate)
+            with m.Case(Op.BranchGE):
+                with m.If(self.rs1_read_data_signed >= self.rs2_read_data_signed):
+                    m.d.comb += self.next_pc.eq(self.pc +
+                                                self.decoder.immediate)
+            with m.Case(Op.BranchLTUnsigned):
+                with m.If(self.registers.rs1_read_data < self.registers.rs2_read_data):
+                    m.d.comb += self.next_pc.eq(self.pc +
+                                                self.decoder.immediate)
+            with m.Case(Op.BranchGEUnsigned):
+                with m.If(self.registers.rs1_read_data >= self.registers.rs2_read_data):
+                    m.d.comb += self.next_pc.eq(self.pc +
+                                                self.decoder.immediate)
+            with m.Case(Op.LoadByte, Op.LoadHalf, Op.LoadWord,
+                        Op.LoadByteUnsigned, Op.LoadHalfUnsigned):
+                m.d.comb += self.registers.rd_write_enable.eq(True)
+                m.d.comb += self.registers.rd_write_data.eq(self.load_data)
+            with m.Case(Op.StoreByte, Op.StoreHalf, Op.StoreWord):
+                m.d.comb += self.memory.write_byte_enables.eq(
+                    self.store_byte_enables)
+            with m.Case(Op.AddImm):
+                m.d.comb += self.registers.rd_write_enable.eq(True)
+                m.d.comb += self.registers.rd_write_data.eq(
+                    self.registers.rs1_read_data + self.decoder.immediate)
+            with m.Case(Op.SetLTImm):
+                m.d.comb += self.registers.rd_write_enable.eq(True)
+                m.d.comb += self.registers.rd_write_data.eq(
+                    Mux(self.rs1_read_data_signed < self.immediate_signed, 1, 0))
+            with m.Case(Op.SetLTImmUnsigned):
+                m.d.comb += self.registers.rd_write_enable.eq(True)
+                m.d.comb += self.registers.rd_write_data.eq(
+                    Mux(self.registers.rs1_read_data < self.decoder.immediate, 1, 0))
+            with m.Case(Op.XorImm):
+                m.d.comb += self.registers.rd_write_enable.eq(True)
+                m.d.comb += self.registers.rd_write_data.eq(
+                    self.registers.rs1_read_data ^ self.decoder.immediate)
+            with m.Case(Op.OrImm):
+                m.d.comb += self.registers.rd_write_enable.eq(True)
+                m.d.comb += self.registers.rd_write_data.eq(
+                    self.registers.rs1_read_data | self.decoder.immediate)
+            with m.Case(Op.AndImm):
+                m.d.comb += self.registers.rd_write_enable.eq(True)
+                m.d.comb += self.registers.rd_write_data.eq(
+                    self.registers.rs1_read_data & self.decoder.immediate)
+            with m.Case(Op.ShiftLeftImm):
+                m.d.comb += self.registers.rd_write_enable.eq(True)
+                m.d.comb += self.registers.rd_write_data.eq(
+                    self.registers.rs1_read_data << self.decoder.immediate[0:5])
+            with m.Case(Op.ShiftRightImm):
+                m.d.comb += self.registers.rd_write_enable.eq(True)
+                with m.If(self.decoder.variant == OpVariant.Sub_ShiftSigned):
+                    m.d.comb += self.registers.rd_write_data.eq(
+                        self.rs1_read_data_signed >> self.decoder.immediate[0:5])
+                with m.Else():
+                    m.d.comb += self.registers.rd_write_data.eq(
+                        self.registers.rs1_read_data >> self.decoder.immediate[0:5])
+            with m.Case(Op.AddOrSub):
+                m.d.comb += self.registers.rd_write_enable.eq(True)
+                with m.If(self.decoder.variant == OpVariant.Sub_ShiftSigned):
+                    m.d.comb += self.registers.rd_write_data.eq(
+                        self.registers.rs1_read_data - self.registers.rs2_read_data)
+                with m.Else():
+                    m.d.comb += self.registers.rd_write_data.eq(
+                        self.registers.rs1_read_data + self.registers.rs2_read_data)
+            with m.Case(Op.SetLT):
+                m.d.comb += self.registers.rd_write_enable.eq(True)
+                m.d.comb += self.registers.rd_write_data.eq(
+                    Mux(self.rs1_read_data_signed < self.rs2_read_data_signed, 1, 0))
+            with m.Case(Op.SetLTUnsigned):
+                m.d.comb += self.registers.rd_write_enable.eq(True)
+                m.d.comb += self.registers.rd_write_data.eq(
+                    Mux(self.registers.rs1_read_data < self.registers.rs2_read_data, 1, 0))
+            with m.Case(Op.Xor):
+                m.d.comb += self.registers.rd_write_enable.eq(True)
+                m.d.comb += self.registers.rd_write_data.eq(
+                    self.registers.rs1_read_data ^ self.registers.rs2_read_data)
+            with m.Case(Op.Or):
+                m.d.comb += self.registers.rd_write_enable.eq(True)
+                m.d.comb += self.registers.rd_write_data.eq(
+                    self.registers.rs1_read_data | self.registers.rs2_read_data)
+            with m.Case(Op.And):
+                m.d.comb += self.registers.rd_write_enable.eq(True)
+                m.d.comb += self.registers.rd_write_data.eq(
+                    self.registers.rs1_read_data & self.registers.rs2_read_data)
+            with m.Case(Op.ShiftLeft):
+                m.d.comb += self.registers.rd_write_enable.eq(True)
+                m.d.comb += self.registers.rd_write_data.eq(
+                    self.registers.rs1_read_data << self.registers.rs2_read_data[0:5])
+            with m.Case(Op.ShiftRight):
+                m.d.comb += self.registers.rd_write_enable.eq(True)
+                with m.If(self.decoder.variant == OpVariant.Sub_ShiftSigned):
+                    m.d.comb += self.registers.rd_write_data.eq(
+                        self.rs1_read_data_signed >> self.registers.rs2_read_data[0:5])
+                with m.Else():
+                    m.d.comb += self.registers.rd_write_data.eq(
+                        self.registers.rs1_read_data >> self.registers.rs2_read_data[0:5])
         return m
