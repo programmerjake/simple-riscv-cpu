@@ -1,0 +1,6 @@
+*.vcd
+*.gtkw
+__pycache__
+.mypy_cache
+*.egg-info
+/.vscode
