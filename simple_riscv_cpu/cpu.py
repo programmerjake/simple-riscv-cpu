@@ -2,14 +2,19 @@
 # See Notices.txt for copyright information
 
 import enum
+import struct
+import os
 from typing import List
 from nmigen.hdl.ast import Cat, Const, Mux, Repl, Signal, signed, unsigned
 from nmigen.hdl.dsl import Module
 from nmigen.hdl.ir import Elaboratable
 from nmigen.hdl.mem import Memory
+from nmigen.cli import main
 
 MEMORY_START_ADDRESS = 0x10000
+MEMORY_END_ADDRESS = 0x1000000
 RESET_ADDRESS = MEMORY_START_ADDRESS
+OUTPUT_PORT_ADDRESS = 0x10000000
 
 
 class CPUMemory(Elaboratable):
@@ -28,6 +33,9 @@ class CPUMemory(Elaboratable):
                               depth=len(initial_words),
                               init=initial_words)
 
+        self.output_port_data = Signal(unsigned(8))
+        self.output_port_valid = Signal()
+
     def elaborate(self, platform):
         m = Module()
 
@@ -44,7 +52,11 @@ class CPUMemory(Elaboratable):
         m.d.comb += write_port.addr.eq((self.address -
                                         MEMORY_START_ADDRESS) >> 2)
         m.d.comb += write_port.data.eq(self.write_data)
-        m.d.comb += write_port.en.eq(self.write_byte_enables)
+        with m.If((self.address >= MEMORY_START_ADDRESS) & (self.address < MEMORY_END_ADDRESS)):
+            m.d.comb += write_port.en.eq(self.write_byte_enables)
+        with m.If(self.address == OUTPUT_PORT_ADDRESS):
+            m.d.comb += self.output_port_data.eq(self.write_data[0:8])
+            m.d.comb += self.output_port_valid.eq(self.write_byte_enables[0])
 
         # instruction read port
         instruction_read_port = self._memory.read_port(domain="comb")
@@ -317,12 +329,13 @@ class CPURegisters(Elaboratable):
 
 
 class CPU(Elaboratable):
-    def __init__(self):
-        self.memory = CPUMemory()
+    def __init__(self, initial_words):
+        self.memory = CPUMemory(initial_words=initial_words)
         self.decoder = CPUDecoder()
         self.registers = CPURegisters()
         self.pc = Signal(unsigned(32), reset=RESET_ADDRESS)
         self.next_pc = Signal(unsigned(32))
+        self.next_pc_fallthrough = Signal(unsigned(32))
         self.load_data = Signal(unsigned(32))
         self.load_data_byte = Signal(unsigned(8))
         self.load_data_half = Signal(unsigned(16))
@@ -332,12 +345,17 @@ class CPU(Elaboratable):
         self.rs1_read_data_signed = Signal(signed(32))
         self.rs2_read_data_signed = Signal(signed(32))
         self.immediate_signed = Signal(signed(32))
+        self.output_port_data = Signal(unsigned(8))
+        self.output_port_valid = Signal()
 
     def elaborate(self, platform):
         m = Module()
         m.submodules.memory = self.memory
         m.submodules.decoder = self.decoder
         m.submodules.registers = self.registers
+
+        m.d.comb += self.output_port_data.eq(self.memory.output_port_data)
+        m.d.comb += self.output_port_valid.eq(self.memory.output_port_valid)
 
         m.d.comb += self.memory.instruction_address.eq(self.pc)
         m.d.comb += self.decoder.instruction_in.eq(
@@ -388,7 +406,8 @@ class CPU(Elaboratable):
                     self.registers.rs2_read_data)
                 m.d.comb += self.load_data.eq(self.memory.read_data)
 
-        m.d.comb += self.next_pc.eq(self.pc + 4)
+        m.d.comb += self.next_pc_fallthrough.eq(self.pc + 4)
+        m.d.comb += self.next_pc.eq(self.next_pc_fallthrough)
         m.d.sync += self.pc.eq(self.next_pc)
 
         with m.Switch(self.decoder.op):
@@ -404,11 +423,13 @@ class CPU(Elaboratable):
                     self.decoder.immediate + self.pc)
             with m.Case(Op.JumpAndLink):
                 m.d.comb += self.registers.rd_write_enable.eq(True)
-                m.d.comb += self.registers.rd_write_data.eq(self.next_pc)
+                m.d.comb += self.registers.rd_write_data.eq(
+                    self.next_pc_fallthrough)
                 m.d.comb += self.next_pc.eq(self.pc + self.decoder.immediate)
             with m.Case(Op.JumpAndLinkReg):
                 m.d.comb += self.registers.rd_write_enable.eq(True)
-                m.d.comb += self.registers.rd_write_data.eq(self.next_pc)
+                m.d.comb += self.registers.rd_write_data.eq(
+                    self.next_pc_fallthrough)
                 m.d.comb += self.next_pc.eq((self.registers.rs1_read_data +
                                              self.decoder.immediate) & ~0x1)
             with m.Case(Op.BranchEQ):
@@ -519,3 +540,14 @@ class CPU(Elaboratable):
                     m.d.comb += self.registers.rd_write_data.eq(
                         self.registers.rs1_read_data >> self.registers.rs2_read_data[0:5])
         return m
+
+
+if __name__ == "__main__":
+    file_name = os.path.dirname(__file__)
+    file_name = os.path.dirname(file_name)
+    file_name = os.path.join(file_name, "software/ram.bin")
+    with open(file_name, "rb") as f:
+        ram_bin = f.read()
+        initial_words = [i[0] for i in struct.iter_unpack("<I", ram_bin)]
+    cpu = CPU(initial_words=initial_words)
+    main(cpu)
